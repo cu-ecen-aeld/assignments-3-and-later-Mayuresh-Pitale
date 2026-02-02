@@ -3,6 +3,7 @@
 # Author: Siddhant Jajoo.
 #editted by Mayuresh Pitale
 # Date: June 6, 2024
+# reference: https://gemini.google.com/share/6906bdd5a2bb
 
 set -e
 set -u
@@ -47,7 +48,7 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} dtbs
 
 fi
-
+# TODO: Copy the kernel image to the outdir
 echo "Adding the Image in outdir"
 cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}/
 
