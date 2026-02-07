@@ -1,7 +1,14 @@
+/*
+ * threading.c
+ *  Edited by: Mayuresh Pitale
+ *  Edited on: 7 Feb, 2026
+ *  reference: https://gemini.google.com/share/9f84aa5c9580
+ */
 #include "threading.h"
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 // Optional: use these functions to add debug or error prints to your application
 #define DEBUG_LOG(msg,...)
