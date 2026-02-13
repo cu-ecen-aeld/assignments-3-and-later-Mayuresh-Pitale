@@ -1,20 +1,18 @@
 #!/bin/sh
+# AESD Socket Start/Stop Script
+#Aurhor: Mayuresh Pitale
+#Date: 02/13/2026
+#references: https://gemini.google.com/share/6827e6a23063
 
 case "$1" in
     start)
         echo "Starting aesdsocket"
-        # Start the daemon. 
-        # -S: Start
-        # -n: Name of the process
-        # -a: Path to executable
-        # --: Pass arguments to the executable (-d for daemon mode)
+
         start-stop-daemon -S -n aesdsocket -a /usr/bin/aesdsocket -- -d
         ;;
     stop)
         echo "Stopping aesdsocket"
-        # Stop the daemon.
-        # -K: Kill/Stop
-        # -n: Name of the process matches 'aesdsocket'
+
         start-stop-daemon -K -n aesdsocket
         ;;
     *)
