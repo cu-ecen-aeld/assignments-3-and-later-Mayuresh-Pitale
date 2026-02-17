@@ -1,0 +1,23 @@
+#!/bin/sh
+# AESD Socket Start/Stop Script
+#Aurhor: Mayuresh Pitale
+#Date: 02/13/2026
+#references: https://gemini.google.com/share/6827e6a23063
+
+case "$1" in
+    start)
+        echo "Starting aesdsocket"
+
+        start-stop-daemon -S -n aesdsocket -a /usr/bin/aesdsocket -- -d
+        ;;
+    stop)
+        echo "Stopping aesdsocket"
+
+        start-stop-daemon -K -n aesdsocket
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+esac
+
+exit 0
