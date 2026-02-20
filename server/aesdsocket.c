@@ -4,6 +4,11 @@
 *Date: 02/13/2026 
 *References: https://gemini.google.com/share/af53bf20979b
 */
+/*
+* AESD Socket Server
+* Author: Mayuresh Pitale
+* Date: 02/13/2026 
+*/
 #include <stdio.h>      // standard I/O
 #include <stdlib.h>     // malloc, free, exit
 #include <string.h>     // memset, strcmp, strerror
@@ -18,208 +23,321 @@
 #include <errno.h>      // errno
 #include <stdbool.h>    // bool type
 #include <sys/stat.h>   // file modes
+#include <pthread.h>    // POSIX threads
+#include <sys/queue.h>  // SLIST macros
+#include <time.h>       // POSIX timers
 
-#define PORT 9000                    // server port
-#define DATA_FILE "/var/tmp/aesdsocketdata" // path to data file
-#define BUFFER_SIZE 1024             // initial buffer chunk size
+#define PORT 9000
+#define DATA_FILE "/var/tmp/aesdsocketdata"
+#define BUFFER_SIZE 1024
 
-int server_fd = -1;   // listening socket descriptor
-int client_fd = -1;   // accepted client socket descriptor
-bool signal_caught = false; // termination signal flag
+// --- Globals ---
+int server_fd = -1;
+volatile sig_atomic_t signal_caught = 0;
+pthread_mutex_t file_mutex;
 
-// Signal handler: mark termination and shutdown sockets
-void handle_signal(int sig) {
-    if (sig == SIGINT || sig == SIGTERM) { // handle termination signals
-        syslog(LOG_INFO, "Caught signal, exiting"); // log signal catch
-        signal_caught = true; // set termination flag
-        if (server_fd != -1) shutdown(server_fd, SHUT_RDWR); // close listener
-        if (client_fd != -1) shutdown(client_fd, SHUT_RDWR); // close client
-    }
-}
+// --- Function Prototypes ---
+ssize_t write_all(int fd, const void *buf, size_t count);
+ssize_t send_all(int sock, const void *buf, size_t len);
 
-// Fork and detach process to run as a daemon
-void make_daemon() {
-    pid_t pid = fork(); // first fork
-    if (pid < 0) exit(EXIT_FAILURE); // fork failed
-    if (pid > 0) exit(EXIT_SUCCESS); // parent exits
+// --- Linked List Node Definition ---
+typedef struct thread_data_s {
+    pthread_t thread_id;
+    int client_fd;
+    bool thread_complete;
+    SLIST_ENTRY(thread_data_s) entries;
+} thread_data_t;
 
-    if (setsid() < 0) exit(EXIT_FAILURE); // create new session
+// Define the head of the list
+SLIST_HEAD(thread_list_head, thread_data_s) head;
 
-    signal(SIGCHLD, SIG_IGN); // ignore child signals
-    signal(SIGHUP, SIG_IGN);  // ignore hangups
+// --- Helper Functions ---
 
-    pid = fork(); // second fork
-    if (pid < 0) exit(EXIT_FAILURE); // fork failed
-    if (pid > 0) exit(EXIT_SUCCESS); // parent exits
-
-    umask(0); // reset file mode creation mask
-    if (chdir("/") < 0) { // change working directory to root
-        syslog(LOG_ERR, "Could not chdir to /"); // log failure
-    }
-
-    long maxfd = sysconf(_SC_OPEN_MAX); // get max file descriptors
-    if (maxfd < 0) maxfd = 1024; // fallback if unknown
-    for (int fd = (int)maxfd; fd >= 0; fd--) { // close all fds
-        if (fd != server_fd) close(fd); // keep listener protected
-    }
-
-    int devnull = open("/dev/null", O_RDWR); // open /dev/null
-    if (devnull != -1) {
-        dup2(devnull, STDIN_FILENO);  // redirect stdin
-        dup2(devnull, STDOUT_FILENO); // redirect stdout
-        dup2(devnull, STDERR_FILENO); // redirect stderr
-        if (devnull > 2) close(devnull); // close extra fd
-    }
-}
-
-// Helper to perform full writes (handle partial writes)
+// Helper to perform full writes
 ssize_t write_all(int fd, const void *buf, size_t count) {
-    size_t total = 0; // bytes written so far
+    size_t total = 0;
     const char *p = buf;
-    while (total < count) { // loop until all bytes written
-        ssize_t w = write(fd, p + total, count - total); // write chunk
+    while (total < count) {
+        ssize_t w = write(fd, p + total, count - total);
         if (w < 0) {
-            if (errno == EINTR) continue; // retry on interrupt
-            return -1; // return error
+            if (errno == EINTR) continue;
+            return -1;
         }
-        total += w; // accumulate bytes written
+        total += w;
     }
-    return total; // return total written
+    return total;
 }
 
-// Helper to perform full sends to socket (handle partial sends)
+// Helper to perform full sends
 ssize_t send_all(int sock, const void *buf, size_t len) {
-    size_t total = 0; // bytes sent so far
+    size_t total = 0;
     const char *p = buf;
-    while (total < len) { // loop until all bytes sent
-        ssize_t s = send(sock, p + total, len - total, MSG_NOSIGNAL); // send chunk
+    while (total < len) {
+        ssize_t s = send(sock, p + total, len - total, MSG_NOSIGNAL);
         if (s < 0) {
-            if (errno == EINTR) continue; // retry on interrupt
-            return -1; // return error
+            if (errno == EINTR) continue;
+            return -1;
         }
-        total += s; // accumulate bytes sent
+        total += s;
     }
-    return total; // return total sent
+    return total;
 }
 
-// Read the entire data file and send its contents to the client
-void send_file_content(int client_socket) {
-    int file_fd = open(DATA_FILE, O_RDONLY); // open data file for reading
-    if (file_fd < 0) {
-        syslog(LOG_ERR, "Failed to open data file for reading: %s", strerror(errno)); // log error
-        return;
-    }
+// --- Thread Functions ---
 
-    char buffer[BUFFER_SIZE]; // temporary read buffer
-    ssize_t bytes_read;
-    while ((bytes_read = read(file_fd, buffer, sizeof(buffer))) > 0) { // read loop
-        if (send_all(client_socket, buffer, (size_t)bytes_read) < 0) { // send chunk
-            syslog(LOG_ERR, "Failed to send data to client: %s", strerror(errno)); // log send error
-            break;
+// Timer thread function
+void timer_thread(union sigval sigval) {
+    char time_str[100];
+    char outstr[200];
+    time_t t;
+    struct tm *tmp;
+
+    time(&t);
+    tmp = localtime(&t);
+    if (tmp == NULL) return;
+
+    strftime(time_str, sizeof(time_str), "%a, %d %b %Y %T %z", tmp); // RFC 2822 format
+    snprintf(outstr, sizeof(outstr), "timestamp:%s\n", time_str);
+
+    // Lock mutex before writing to the shared file
+    if (pthread_mutex_lock(&file_mutex) == 0) {
+        int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            write_all(fd, outstr, strlen(outstr));
+            close(fd);
+        }
+        pthread_mutex_unlock(&file_mutex);
+    }
+}
+
+// Client connection thread handler
+void* thread_handler(void* thread_param) {
+    thread_data_t* data = (thread_data_t*)thread_param;
+    char* packet_buffer = NULL;
+    size_t current_buffer_size = BUFFER_SIZE;
+    size_t total_received = 0;
+    ssize_t bytes_received;
+
+    packet_buffer = (char*)malloc(current_buffer_size);
+    if (!packet_buffer) goto cleanup_thread;
+
+    // Receive Loop
+    while ((bytes_received = recv(data->client_fd, packet_buffer + total_received, 
+                                  current_buffer_size - total_received, 0)) > 0) {
+        
+        total_received += bytes_received;
+        
+        // Check for newline
+        if (memchr(packet_buffer + total_received - bytes_received, '\n', bytes_received) != NULL) {
+            
+            // CRITICAL SECTION: Lock mutex for File I/O
+            pthread_mutex_lock(&file_mutex);
+            
+            // 1. Write packet to file
+            int file_fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (file_fd >= 0) {
+                write_all(file_fd, packet_buffer, total_received);
+                close(file_fd);
+            }
+
+            // 2. Read full file and send back
+            file_fd = open(DATA_FILE, O_RDONLY);
+            if (file_fd >= 0) {
+                char read_buf[BUFFER_SIZE];
+                ssize_t read_bytes;
+                while ((read_bytes = read(file_fd, read_buf, sizeof(read_buf))) > 0) {
+                    send_all(data->client_fd, read_buf, read_bytes);
+                }
+                close(file_fd);
+            }
+            
+            pthread_mutex_unlock(&file_mutex);
+            // END CRITICAL SECTION
+
+            total_received = 0; // Reset for next packet
+        } 
+        else if (total_received == current_buffer_size) {
+            current_buffer_size *= 2;
+            char *tmp = realloc(packet_buffer, current_buffer_size);
+            if (!tmp) break; 
+            packet_buffer = tmp;
         }
     }
-    if (bytes_read < 0) {
-        syslog(LOG_ERR, "Error reading data file: %s", strerror(errno)); // log read error
-    }
-    close(file_fd); // close file descriptor
+
+cleanup_thread:
+    if (packet_buffer) free(packet_buffer);
+    close(data->client_fd);
+    data->thread_complete = true;
+    return NULL;
 }
+
+// --- System Functions ---
+
+void handle_signal(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) {
+        syslog(LOG_INFO, "Caught signal, exiting");
+        signal_caught = 1;
+        if (server_fd != -1) shutdown(server_fd, SHUT_RDWR);
+    }
+}
+
+void make_daemon() {
+    pid_t pid = fork();
+    if (pid < 0) exit(EXIT_FAILURE);
+    if (pid > 0) exit(EXIT_SUCCESS);
+
+    if (setsid() < 0) exit(EXIT_FAILURE);
+
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+
+    pid = fork();
+    if (pid < 0) exit(EXIT_FAILURE);
+    if (pid > 0) exit(EXIT_SUCCESS);
+
+    umask(0);
+    if (chdir("/") < 0) syslog(LOG_ERR, "Could not chdir to /");
+
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0) maxfd = 1024;
+    for (int fd = (int)maxfd; fd >= 0; fd--) {
+        if (fd != server_fd) close(fd);
+    }
+
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull != -1) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > 2) close(devnull);
+    }
+}
+
+// --- Main ---
 
 int main(int argc, char *argv[]) {
-    bool daemon_mode = (argc == 2 && strcmp(argv[1], "-d") == 0); // check -d flag
-    struct sockaddr_in address; // server address struct
-    int optval = 1; // socket option value
+    bool daemon_mode = (argc == 2 && strcmp(argv[1], "-d") == 0);
+    struct sockaddr_in address;
+    int optval = 1;
 
-    // 1. Setup Signal Handling FIRST
-    struct sigaction sa; // sigaction struct
-    memset(&sa, 0, sizeof(sa)); // clear struct
-    sa.sa_handler = handle_signal; // assign handler
-    sigaction(SIGINT, &sa, NULL); // register SIGINT
-    sigaction(SIGTERM, &sa, NULL); // register SIGTERM
-    signal(SIGPIPE, SIG_IGN); // ignore SIGPIPE to avoid termination
+    // Init mutex and list
+    pthread_mutex_init(&file_mutex, NULL);
+    SLIST_INIT(&head);
 
-    // 2. Create and Bind Socket
-    server_fd = socket(AF_INET, SOCK_STREAM, 0); // create TCP socket
-    if (server_fd < 0) return -1; // exit on failure
+    // Setup signals
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN); // Ignore broken pipes
 
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)); // allow address reuse
+    // Create and bind socket
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) return -1;
 
-    memset(&address, 0, sizeof(address)); // clear address
-    address.sin_family = AF_INET; // IPv4
-    address.sin_addr.s_addr = INADDR_ANY; // bind to all interfaces
-    address.sin_port = htons(PORT); // set port in network byte order
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) { // bind socket
-        close(server_fd); // cleanup on failure
-        return -1; // exit
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        close(server_fd);
+        return -1;
     }
 
-    // 3. Daemonize BEFORE opening logs if requested
-    if (daemon_mode) {
-        make_daemon(); // detach and run in background
+    if (daemon_mode) make_daemon();
+
+    openlog("aesdsocket", LOG_PID, LOG_USER);
+
+    if (listen(server_fd, 10) < 0) {
+        syslog(LOG_ERR, "Listen failed");
+        goto cleanup;
     }
 
-    // 4. Start Logging (Now safe for Daemon mode)
-    openlog("aesdsocket", LOG_PID, LOG_USER); // open syslog
+    // Setup POSIX timer
+    timer_t timer_id;
+    bool timer_created = false;
+    struct sigevent sev;
+    struct itimerspec its;
 
-    if (listen(server_fd, 10) < 0) { // start listening for connections
-        syslog(LOG_ERR, "Listen failed"); // log error
-        goto cleanup; // jump to cleanup
+    memset(&sev, 0, sizeof(struct sigevent));
+    sev.sigev_notify = SIGEV_THREAD;
+    sev.sigev_notify_function = timer_thread;
+    
+    if (timer_create(CLOCK_REALTIME, &sev, &timer_id) == 0) {
+        timer_created = true;
+        its.it_value.tv_sec = 10;
+        its.it_value.tv_nsec = 0;
+        its.it_interval.tv_sec = 10;
+        its.it_interval.tv_nsec = 0;
+        timer_settime(timer_id, 0, &its, NULL);
     }
 
-    while (!signal_caught) { // main accept loop
-        struct sockaddr_in client_addr; // client address
-        socklen_t client_len = sizeof(client_addr); // client address length
+    // Main accept loop
+    while (!signal_caught) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
 
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len); // accept connection
-        if (client_fd < 0) { // accept error handling
-            if (signal_caught) break; // break if terminating
-            continue; // otherwise continue accepting
+        int new_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (new_fd < 0) {
+            if (signal_caught) break;
+            continue;
         }
 
-        char client_ip[INET_ADDRSTRLEN]; // buffer for client IP string
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN); // convert IP
-        syslog(LOG_INFO, "Accepted connection from %s", client_ip); // log connection
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
 
-        // Packet processing
-        size_t current_buffer_size = BUFFER_SIZE; // initial buffer size
-        char *packet_buffer = malloc(current_buffer_size); // dynamic receive buffer
-        size_t total_received = 0; // bytes currently in buffer
-        ssize_t bytes_received;
+        thread_data_t *new_node = (thread_data_t *)malloc(sizeof(thread_data_t));
+        if (new_node == NULL) {
+            syslog(LOG_ERR, "Malloc failed");
+            close(new_fd);
+            continue;
+        }
 
-        // Loop to receive data until the client closes or we find a newline
-        while ((bytes_received = recv(client_fd, packet_buffer + total_received, 
-                                      current_buffer_size - total_received, 0)) > 0) {
-            
-            size_t old_total = total_received; // track where new data starts
-            total_received += bytes_received; // update total received
+        new_node->client_fd = new_fd;
+        new_node->thread_complete = false;
 
-            // Check the NEWLY received chunk for a newline
-            char *newline_ptr = memchr(packet_buffer + old_total, '\n', bytes_received); // search for newline
-            
-            if (newline_ptr != NULL) { // complete packet received
-                int file_fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644); // open file for append
-                if (file_fd >= 0) {
-                    write_all(file_fd, packet_buffer, total_received); // write entire packet
-                    close(file_fd); // close file after write
-                    send_file_content(client_fd); // send file contents back to client
-                }
-                total_received = 0; // reset buffer for next packet
-            } else if (total_received >= current_buffer_size) { // need more space
-                current_buffer_size += BUFFER_SIZE; // grow buffer in chunks
-                packet_buffer = realloc(packet_buffer, current_buffer_size); // resize buffer
+        if (pthread_create(&new_node->thread_id, NULL, thread_handler, new_node) != 0) {
+            syslog(LOG_ERR, "Thread creation failed");
+            free(new_node);
+            close(new_fd);
+            continue;
+        }
+
+        SLIST_INSERT_HEAD(&head, new_node, entries);
+
+        // Reap finished threads manually (safe traversal without macro)
+        thread_data_t *cursor = SLIST_FIRST(&head);
+        while (cursor != NULL) {
+            thread_data_t *temp = SLIST_NEXT(cursor, entries); // Save next before modifying
+            if (cursor->thread_complete) {
+                pthread_join(cursor->thread_id, NULL);
+                SLIST_REMOVE(&head, cursor, thread_data_s, entries);
+                free(cursor);
             }
+            cursor = temp;
         }
-
-        free(packet_buffer); // free receive buffer
-        syslog(LOG_INFO, "Closed connection from %s", client_ip); // log close
-        close(client_fd); // close client socket
-        client_fd = -1; // reset client fd
     }
 
 cleanup:
-    if (server_fd != -1) close(server_fd); // close server socket if open
-    unlink(DATA_FILE); // remove data file on exit
-    syslog(LOG_INFO, "Cleaning up and exiting"); // final log
-    closelog(); // close syslog
-    return 0; // exit
+    // Join all remaining threads gracefully
+    while (!SLIST_EMPTY(&head)) {
+        thread_data_t *elem = SLIST_FIRST(&head);
+        shutdown(elem->client_fd, SHUT_RDWR); // Force blocking recv() to exit
+        pthread_join(elem->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&head, entries);
+        free(elem);
+    }
+
+    if (timer_created) timer_delete(timer_id);
+    pthread_mutex_destroy(&file_mutex);
+    if (server_fd != -1) close(server_fd);
+    unlink(DATA_FILE);
+    closelog();
+    
+    return 0;
 }
