@@ -9,6 +9,7 @@
 * Author: Mayuresh Pitale
 * Date: 02/13/2026 
 */
+
 #include <stdio.h>      // standard I/O
 #include <stdlib.h>     // malloc, free, exit
 #include <string.h>     // memset, strcmp, strerror
@@ -28,8 +29,18 @@
 #include <time.h>       // POSIX timers
 
 #define PORT 9000
-#define DATA_FILE "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
+
+// Assignment 8: Build switch for character device
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+    #define DATA_FILE "/dev/aesdchar"
+#else
+    #define DATA_FILE "/var/tmp/aesdsocketdata"
+#endif
 
 // --- Globals ---
 int server_fd = -1;
@@ -48,12 +59,10 @@ typedef struct thread_data_s {
     SLIST_ENTRY(thread_data_s) entries;
 } thread_data_t;
 
-// Define the head of the list
 SLIST_HEAD(thread_list_head, thread_data_s) head;
 
 // --- Helper Functions ---
 
-// Helper to perform full writes
 ssize_t write_all(int fd, const void *buf, size_t count) {
     size_t total = 0;
     const char *p = buf;
@@ -68,7 +77,6 @@ ssize_t write_all(int fd, const void *buf, size_t count) {
     return total;
 }
 
-// Helper to perform full sends
 ssize_t send_all(int sock, const void *buf, size_t len) {
     size_t total = 0;
     const char *p = buf;
@@ -85,7 +93,8 @@ ssize_t send_all(int sock, const void *buf, size_t len) {
 
 // --- Thread Functions ---
 
-// Timer thread function
+#if !USE_AESD_CHAR_DEVICE
+// Timer thread function (Disabled for Assignment 8)
 void timer_thread(union sigval sigval) {
     char time_str[100];
     char outstr[200];
@@ -96,10 +105,9 @@ void timer_thread(union sigval sigval) {
     tmp = localtime(&t);
     if (tmp == NULL) return;
 
-    strftime(time_str, sizeof(time_str), "%a, %d %b %Y %T %z", tmp); // RFC 2822 format
+    strftime(time_str, sizeof(time_str), "%a, %d %b %Y %T %z", tmp);
     snprintf(outstr, sizeof(outstr), "timestamp:%s\n", time_str);
 
-    // Lock mutex before writing to the shared file
     if (pthread_mutex_lock(&file_mutex) == 0) {
         int fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
@@ -109,8 +117,8 @@ void timer_thread(union sigval sigval) {
         pthread_mutex_unlock(&file_mutex);
     }
 }
+#endif
 
-// Client connection thread handler
 void* thread_handler(void* thread_param) {
     thread_data_t* data = (thread_data_t*)thread_param;
     char* packet_buffer = NULL;
@@ -121,40 +129,38 @@ void* thread_handler(void* thread_param) {
     packet_buffer = (char*)malloc(current_buffer_size);
     if (!packet_buffer) goto cleanup_thread;
 
-    // Receive Loop
     while ((bytes_received = recv(data->client_fd, packet_buffer + total_received, 
                                   current_buffer_size - total_received, 0)) > 0) {
         
         total_received += bytes_received;
         
-        // Check for newline
+        // If newline detected, write to device and read back
         if (memchr(packet_buffer + total_received - bytes_received, '\n', bytes_received) != NULL) {
             
-            // CRITICAL SECTION: Lock mutex for File I/O
             pthread_mutex_lock(&file_mutex);
             
-            // 1. Write packet to file
-            int file_fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            // For Assignment 8, we open the device and append data
+            int file_fd = open(DATA_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
             if (file_fd >= 0) {
                 write_all(file_fd, packet_buffer, total_received);
+                
+                // Read everything back from the driver
+                // Re-open for clean reading from the start (offset 0)
                 close(file_fd);
-            }
-
-            // 2. Read full file and send back
-            file_fd = open(DATA_FILE, O_RDONLY);
-            if (file_fd >= 0) {
-                char read_buf[BUFFER_SIZE];
-                ssize_t read_bytes;
-                while ((read_bytes = read(file_fd, read_buf, sizeof(read_buf))) > 0) {
-                    send_all(data->client_fd, read_buf, read_bytes);
+                file_fd = open(DATA_FILE, O_RDONLY);
+                
+                if (file_fd >= 0) {
+                    char read_buf[BUFFER_SIZE];
+                    ssize_t read_bytes;
+                    while ((read_bytes = read(file_fd, read_buf, sizeof(read_buf))) > 0) {
+                        send_all(data->client_fd, read_buf, read_bytes);
+                    }
+                    close(file_fd);
                 }
-                close(file_fd);
             }
             
             pthread_mutex_unlock(&file_mutex);
-            // END CRITICAL SECTION
-
-            total_received = 0; // Reset for next packet
+            total_received = 0; 
         } 
         else if (total_received == current_buffer_size) {
             current_buffer_size *= 2;
@@ -185,7 +191,6 @@ void make_daemon() {
     pid_t pid = fork();
     if (pid < 0) exit(EXIT_FAILURE);
     if (pid > 0) exit(EXIT_SUCCESS);
-
     if (setsid() < 0) exit(EXIT_FAILURE);
 
     signal(SIGCHLD, SIG_IGN);
@@ -196,7 +201,7 @@ void make_daemon() {
     if (pid > 0) exit(EXIT_SUCCESS);
 
     umask(0);
-    if (chdir("/") < 0) syslog(LOG_ERR, "Could not chdir to /");
+    chdir("/");
 
     long maxfd = sysconf(_SC_OPEN_MAX);
     if (maxfd < 0) maxfd = 1024;
@@ -220,19 +225,16 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in address;
     int optval = 1;
 
-    // Init mutex and list
     pthread_mutex_init(&file_mutex, NULL);
     SLIST_INIT(&head);
 
-    // Setup signals
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN); // Ignore broken pipes
+    signal(SIGPIPE, SIG_IGN);
 
-    // Create and bind socket
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) return -1;
 
@@ -257,7 +259,7 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    // Setup POSIX timer
+#if !USE_AESD_CHAR_DEVICE
     timer_t timer_id;
     bool timer_created = false;
     struct sigevent sev;
@@ -275,8 +277,8 @@ int main(int argc, char *argv[]) {
         its.it_interval.tv_nsec = 0;
         timer_settime(timer_id, 0, &its, NULL);
     }
+#endif
 
-    // Main accept loop
     while (!signal_caught) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -287,33 +289,21 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-        syslog(LOG_INFO, "Accepted connection from %s", client_ip);
-
         thread_data_t *new_node = (thread_data_t *)malloc(sizeof(thread_data_t));
-        if (new_node == NULL) {
-            syslog(LOG_ERR, "Malloc failed");
-            close(new_fd);
-            continue;
+        if (new_node) {
+            new_node->client_fd = new_fd;
+            new_node->thread_complete = false;
+            if (pthread_create(&new_node->thread_id, NULL, thread_handler, new_node) != 0) {
+                close(new_fd);
+                free(new_node);
+            } else {
+                SLIST_INSERT_HEAD(&head, new_node, entries);
+            }
         }
 
-        new_node->client_fd = new_fd;
-        new_node->thread_complete = false;
-
-        if (pthread_create(&new_node->thread_id, NULL, thread_handler, new_node) != 0) {
-            syslog(LOG_ERR, "Thread creation failed");
-            free(new_node);
-            close(new_fd);
-            continue;
-        }
-
-        SLIST_INSERT_HEAD(&head, new_node, entries);
-
-        // Reap finished threads manually (safe traversal without macro)
         thread_data_t *cursor = SLIST_FIRST(&head);
         while (cursor != NULL) {
-            thread_data_t *temp = SLIST_NEXT(cursor, entries); // Save next before modifying
+            thread_data_t *temp = SLIST_NEXT(cursor, entries);
             if (cursor->thread_complete) {
                 pthread_join(cursor->thread_id, NULL);
                 SLIST_REMOVE(&head, cursor, thread_data_s, entries);
@@ -324,19 +314,21 @@ int main(int argc, char *argv[]) {
     }
 
 cleanup:
-    // Join all remaining threads gracefully
     while (!SLIST_EMPTY(&head)) {
         thread_data_t *elem = SLIST_FIRST(&head);
-        shutdown(elem->client_fd, SHUT_RDWR); // Force blocking recv() to exit
+        shutdown(elem->client_fd, SHUT_RDWR);
         pthread_join(elem->thread_id, NULL);
         SLIST_REMOVE_HEAD(&head, entries);
         free(elem);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (timer_created) timer_delete(timer_id);
+    unlink(DATA_FILE); 
+#endif
+
     pthread_mutex_destroy(&file_mutex);
     if (server_fd != -1) close(server_fd);
-    unlink(DATA_FILE);
     closelog();
     
     return 0;
