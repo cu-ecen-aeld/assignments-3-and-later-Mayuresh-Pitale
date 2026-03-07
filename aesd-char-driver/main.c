@@ -22,7 +22,7 @@
 int aesd_major =   0;
 int aesd_minor =   0;
 
-MODULE_AUTHOR("Mayuresh Pitale"); 
+MODULE_AUTHOR("Mayuresh-Pitale"); 
 MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
@@ -63,7 +63,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
         size_t available_bytes = entry->size - entry_offset_byte;
         size_t bytes_to_copy = (available_bytes < count) ? available_bytes : count;
 
-        if (copy_to_user(buf, entry->buffer + entry_offset_byte, bytes_to_copy)) {
+        if (copy_to_user(buf, entry->buffptr + entry_offset_byte, bytes_to_copy)) {
             retval = -EFAULT;
             goto out;
         }
@@ -88,13 +88,13 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
         return -ERESTARTSYS;
 
     // Allocate/Expand memory for the current write command
-    dev->tmp_entry.buffer = krealloc(dev->tmp_entry.buffer, dev->tmp_entry.size + count, GFP_KERNEL);
-    if (!dev->tmp_entry.buffer) {
+    dev->tmp_entry.buffptr = krealloc(dev->tmp_entry.buffptr, dev->tmp_entry.size + count, GFP_KERNEL);
+    if (!dev->tmp_entry.buffptr) {
         goto out;
     }
 
     // Copy data from user space
-    if (copy_from_user((char *)dev->tmp_entry.buffer + dev->tmp_entry.size, buf, count)) {
+    if (copy_from_user((char *)dev->tmp_entry.buffptr + dev->tmp_entry.size, buf, count)) {
         retval = -EFAULT;
         goto out;
     }
@@ -102,7 +102,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     dev->tmp_entry.size += count;
 
     // If the write command ends in a newline, add it to the circular buffer
-    if (memchr(dev->tmp_entry.buffer, '\n', dev->tmp_entry.size)) {
+    if (memchr(dev->tmp_entry.buffptr, '\n', dev->tmp_entry.size)) {
         overwritten_buffer = aesd_circular_buffer_add_entry(&dev->buffer, &dev->tmp_entry);
         
         // Free the memory of the oldest entry if it was overwritten
@@ -111,7 +111,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
         }
 
         // Reset the temp entry for the next write command
-        dev->tmp_entry.buffer = NULL;
+        dev->tmp_entry.buffptr = NULL;
         dev->tmp_entry.size = 0;
     }
 
@@ -179,8 +179,8 @@ void aesd_cleanup_module(void)
 
     // Free all allocated memory in the circular buffer
     AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.buffer, index) {
-        if (entry->buffer) {
-            kfree(entry->buffer);
+        if (entry->buffptr) {
+            kfree(entry->buffptr);
         }
     }
 
