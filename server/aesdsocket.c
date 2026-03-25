@@ -27,7 +27,8 @@
 #include <pthread.h>    // POSIX threads
 #include <sys/queue.h>  // SLIST macros
 #include <time.h>       // POSIX timers
-
+#include <sys/ioctl.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 #define PORT 9000
 #define BUFFER_SIZE 1024
 
@@ -139,29 +140,54 @@ void* thread_handler(void* thread_param) {
             
             pthread_mutex_lock(&file_mutex);
             
-            // For Assignment 8, we open the device and append data
+            // 1. Check if the incoming packet is an IOCTL command
+            const char *ioctl_prefix = "AESDCHAR_IOCSEEKTO:";
+            struct aesd_seekto seek_params;
+            int is_ioctl = 0;
+
+            if (strncmp(packet_buffer, ioctl_prefix, strlen(ioctl_prefix)) == 0) {
+                if (sscanf(packet_buffer, "AESDCHAR_IOCSEEKTO:%u,%u", 
+                           &seek_params.write_cmd, 
+                           &seek_params.write_cmd_offset) == 2) {
+                    is_ioctl = 1;
+                }
+            }
+
             int file_fd = open(DATA_FILE, O_RDWR | O_APPEND | O_CREAT, 0644);
             if (file_fd >= 0) {
-                write_all(file_fd, packet_buffer, total_received);
                 
-                // Read everything back from the driver
-                // Re-open for clean reading from the start (offset 0)
-                close(file_fd);
-                file_fd = open(DATA_FILE, O_RDONLY);
+                if (is_ioctl) {
+                    // 2a. Execute IOCTL
+                    syslog(LOG_DEBUG, "Executing ioctl cmd:%u offset:%u", 
+                           seek_params.write_cmd, seek_params.write_cmd_offset);
+                    ioctl(file_fd, AESDCHAR_IOCSEEKTO, &seek_params);
                 
+                } else {
+                    // 2b. Standard Write
+                    write_all(file_fd, packet_buffer, total_received);
+                    
+                    // Re-open for clean reading from the start (offset 0)
+                    close(file_fd);
+                    file_fd = open(DATA_FILE, O_RDONLY);
+                }
+                
+                // 3. Read everything back from the driver
                 if (file_fd >= 0) {
                     char read_buf[BUFFER_SIZE];
                     ssize_t read_bytes;
                     while ((read_bytes = read(file_fd, read_buf, sizeof(read_buf))) > 0) {
                         send_all(data->client_fd, read_buf, read_bytes);
                     }
-                    close(file_fd);
+                    close(file_fd); // Finally, close it once the transaction is done
                 }
             }
             
             pthread_mutex_unlock(&file_mutex);
+            
+            // Clear the buffer to prevent leftover string fragments from messing up future parses
+            memset(packet_buffer, 0, current_buffer_size); 
             total_received = 0; 
-        } 
+        }
         else if (total_received == current_buffer_size) {
             current_buffer_size *= 2;
             char *tmp = realloc(packet_buffer, current_buffer_size);

@@ -18,6 +18,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>    // For kmalloc/kfree/krealloc
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 
 int aesd_major =   0;
 int aesd_minor =   0;
@@ -122,12 +123,100 @@ out:
     return retval;
 }
 
+loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t size = 0;
+    struct aesd_buffer_entry *entry;
+    int i;
+    loff_t retval;
+
+    if (mutex_lock_interruptible(&dev->lock)) {
+        return -ERESTARTSYS;
+    }
+
+    // FIXED: Changed dev->circular_buffer to dev->buffer
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, i) {
+        if (entry->size > 0) {
+            size += entry->size;
+        }
+    }
+
+    retval = fixed_size_llseek(filp, offset, whence, size);
+
+    mutex_unlock(&dev->lock);
+    return retval;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    struct aesd_dev *dev = filp->private_data;
+    struct aesd_seekto seek_params;
+    long retval = 0;
+    uint32_t i;
+    struct aesd_buffer_entry *entry;
+    size_t global_offset = 0;
+    int cmd_found = 0;
+
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) return -ENOTTY;
+    if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) return -ENOTTY;
+
+    switch (cmd) {
+        case AESDCHAR_IOCSEEKTO:
+            if (copy_from_user(&seek_params, (const void __user *)arg, sizeof(seek_params))) {
+                return -EFAULT;
+            }
+
+            if (mutex_lock_interruptible(&dev->lock)) {
+                return -ERESTARTSYS;
+            }
+
+            for (i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+                // FIXED: Changed dev->circular_buffer to dev->buffer
+                int buffer_idx = (dev->buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+                entry = &dev->buffer.entry[buffer_idx];
+
+                if (entry->size == 0) {
+                    break; 
+                }
+
+                if (i == seek_params.write_cmd) {
+                    if (seek_params.write_cmd_offset >= entry->size) {
+                        retval = -EINVAL; 
+                    } else {
+                        global_offset += seek_params.write_cmd_offset;
+                        filp->f_pos = global_offset;
+                        cmd_found = 1;
+                    }
+                    break;
+                }
+                global_offset += entry->size;
+            }
+
+            if (!cmd_found && retval == 0) {
+                retval = -EINVAL; 
+            }
+
+            mutex_unlock(&dev->lock);
+            break;
+
+        default:
+            retval = -ENOTTY;
+            break;
+    }
+
+    return retval;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,           
+    .unlocked_ioctl = aesd_ioctl,      
+    .compat_ioctl = compat_ptr_ioctl,  
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
